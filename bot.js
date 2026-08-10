@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const {
   Client, GatewayIntentBits, Partials,
   EmbedBuilder, PermissionFlagsBits,
@@ -2102,4 +2104,8 @@ client.on('messageCreate', async message => {
   }
 });
 
+if (!process.env.BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN is not set. Add it to your .env file (BOT_TOKEN=your_token) or set it in your host\'s environment variables.');
+  process.exit(1);
+}
 client.login(process.env.BOT_TOKEN);
