@@ -907,8 +907,8 @@ async function autoRestore(guild) {
 client.once('ready', async () => {
   console.log(`✅ ${client.user.tag} online`);
   client.user.setPresence({
-    activities: [{ name: 'BREN IS COOL', type: ActivityType.Watching }],
-    status: 'online',
+    activities: [{ name: 'Siege', type: ActivityType.Playing }],
+    status: 'dnd',
   });
 
   for (const guild of client.guilds.cache.values()) {
