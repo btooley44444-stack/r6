@@ -908,7 +908,7 @@ client.once('ready', async () => {
   console.log(`✅ ${client.user.tag} online`);
   client.user.setPresence({
     activities: [{ name: 'BREN THE GOAT', type: ActivityType.Watching }],
-    status: 'do not disturb',
+    status: 'dnd',
   });
 
   for (const guild of client.guilds.cache.values()) {
