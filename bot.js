@@ -907,7 +907,7 @@ async function autoRestore(guild) {
 client.once('ready', async () => {
   console.log(`✅ ${client.user.tag} online`);
   client.user.setPresence({
-    activities: [{ name: 'BREN THE GOAT' type: ActivityType.Watching }],
+    activities: [{ name: 'BREN THE GOAT', type: ActivityType.Watching }],
     status: 'do not disturb',
   });
 
