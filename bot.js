@@ -3,7 +3,7 @@ const {
   EmbedBuilder, PermissionFlagsBits,
   AuditLogEvent, ActivityType, Collection,
   ActionRowBuilder, StringSelectMenuBuilder, ComponentType,
-  AttachmentBuilder,
+  AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelType,
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
 const crypto = require('crypto');
@@ -124,6 +124,199 @@ function formatDuration(ms) {
   if (ms >= 60000)    return `${Math.round(ms / 60000)}m`;
   return `${Math.round(ms / 1000)}s`;
 }
+
+// ─────────────────────────────────────────────
+//  TICKET SYSTEM
+//  db layout:
+//    tickets.<gid>.config          → { role, category, log, limit }
+//    tickets.<gid>.counter         → number (auto-increment)
+//    tickets.<gid>.open.<chId>     → { userId, number, claimedBy, openedAt }
+// ─────────────────────────────────────────────
+async function getTicketConfig(gid) {
+  return (await db.get(`tickets.${gid}.config`)) || {};
+}
+
+// Is this member allowed to manage tickets? (support role OR ManageChannels)
+function isSupport(member, cfg) {
+  return (cfg.role && member.roles.cache.has(cfg.role)) ||
+         member.permissions.has(PermissionFlagsBits.ManageChannels);
+}
+
+// Build a plain-text transcript of a ticket channel (newest → oldest fetch, then reversed)
+async function buildTranscript(channel, ticket) {
+  const lines = [];
+  let lastId;
+  for (let i = 0; i < 5; i++) { // up to 500 messages
+    const batch = await channel.messages.fetch({ limit: 100, ...(lastId && { before: lastId }) }).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    lines.push(...batch.values());
+    lastId = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  lines.reverse();
+  const header = [
+    `Transcript — #${channel.name} (${channel.guild.name})`,
+    `Opened by: ${ticket?.userId ? `user ID ${ticket.userId}` : 'unknown'}`,
+    `Opened at: ${ticket?.openedAt ? new Date(ticket.openedAt).toISOString() : 'unknown'}`,
+    `Closed at: ${new Date().toISOString()}`,
+    `Messages: ${lines.length}`,
+    '─'.repeat(50),
+  ].join('\n');
+  const body = lines.map(m => {
+    const time = new Date(m.createdTimestamp).toISOString().replace('T', ' ').slice(0, 19);
+    const attach = m.attachments.size ? ` [attachments: ${[...m.attachments.values()].map(a => a.url).join(' ')}]` : '';
+    const embeds = m.embeds.length ? ` [${m.embeds.length} embed(s)]` : '';
+    return `[${time}] ${m.author.tag}: ${m.content || ''}${attach}${embeds}`;
+  }).join('\n');
+  return Buffer.from(`${header}\n${body}`, 'utf8');
+}
+
+async function closeTicket(channel, closedBy) {
+  const gid = channel.guild.id;
+  const ticket = await db.get(`tickets.${gid}.open.${channel.id}`);
+  const cfg = await getTicketConfig(gid);
+
+  // Transcript — build the buffer once, wrap in a fresh AttachmentBuilder per send
+  let buf = null;
+  try { buf = await buildTranscript(channel, ticket); } catch {}
+  const makeFile = () => buf ? new AttachmentBuilder(buf, { name: `${channel.name}-transcript.txt` }) : null;
+  const file = makeFile();
+
+  const summary = new EmbedBuilder()
+    .setColor(0xff4444)
+    .setTitle('🎫 Ticket Closed')
+    .addFields(
+      { name: 'Ticket', value: `#${channel.name}`, inline: true },
+      { name: 'Opened by', value: ticket?.userId ? `<@${ticket.userId}>` : 'Unknown', inline: true },
+      { name: 'Closed by', value: `${closedBy}`, inline: true },
+      { name: 'Claimed by', value: ticket?.claimedBy ? `<@${ticket.claimedBy}>` : 'Unclaimed', inline: true },
+    )
+    .setTimestamp();
+
+  // Send transcript to log channel
+  if (cfg.log) {
+    const logCh = channel.guild.channels.cache.get(cfg.log) ?? await channel.guild.channels.fetch(cfg.log).catch(() => null);
+    if (logCh) await logCh.send({ embeds: [summary], ...(file && { files: [file] }) }).catch(() => {});
+  }
+
+  // DM transcript to the ticket opener
+  if (ticket?.userId) {
+    const user = await client.users.fetch(ticket.userId).catch(() => null);
+    if (user) {
+      const dmFile = makeFile(); // fresh AttachmentBuilder — one instance can only be sent once
+      await user.send({ embeds: [summary], ...(dmFile && { files: [dmFile] }) }).catch(() => {}); // DMs closed — ignore
+    }
+  }
+
+  await db.delete(`tickets.${gid}.open.${channel.id}`);
+  await channel.delete(`Ticket closed by ${closedBy.tag ?? closedBy}`).catch(() => {});
+}
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isButton() || !interaction.inGuild()) return;
+  const { customId, guild, member } = interaction;
+  if (!customId.startsWith('ticket_')) return;
+
+  const cfg = await getTicketConfig(guild.id);
+
+  // ── Open a ticket ────────────────────────────────────────────
+  if (customId === 'ticket_open') {
+    // One open ticket per user (configurable limit)
+    const open = (await db.get(`tickets.${guild.id}.open`)) || {};
+    const mine = Object.entries(open).filter(([, t]) => t?.userId === interaction.user.id);
+    const limit = cfg.limit || 1;
+    if (mine.length >= limit) {
+      return interaction.reply({ content: `❌ You already have ${mine.length >= 2 ? `${mine.length} open tickets` : `an open ticket`}: <#${mine[0][0]}>`, ephemeral: true });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const number = ((await db.get(`tickets.${guild.id}.counter`)) || 0) + 1;
+    await db.set(`tickets.${guild.id}.counter`, number);
+
+    const overwrites = [
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.ReadMessageHistory] },
+      { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory] },
+    ];
+    if (cfg.role && guild.roles.cache.has(cfg.role)) {
+      overwrites.push({ id: cfg.role, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] });
+    }
+
+    let channel;
+    try {
+      channel = await guild.channels.create({
+        name: `ticket-${String(number).padStart(4, '0')}`,
+        type: ChannelType.GuildText,
+        parent: cfg.category || null,
+        topic: `Ticket #${number} • Opened by ${interaction.user.tag} (${interaction.user.id})`,
+        permissionOverwrites: overwrites,
+        reason: `Ticket opened by ${interaction.user.tag}`,
+      });
+    } catch (e) {
+      // Most common failure: category is full (50 channels) or missing perms
+      return interaction.editReply(`❌ Couldn't create the ticket channel — ${/maximum/i.test(e.message) ? 'the ticket category is full (50 channel limit).' : 'check that I have **Manage Channels** permission.'}`);
+    }
+
+    await db.set(`tickets.${guild.id}.open.${channel.id}`, {
+      userId: interaction.user.id, number, claimedBy: null, openedAt: Date.now(),
+    });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ticket_close').setLabel('Close').setEmoji('🔒').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('ticket_claim').setLabel('Claim').setEmoji('🙋').setStyle(ButtonStyle.Secondary),
+    );
+    await channel.send({
+      content: `${interaction.user}${cfg.role ? ` • <@&${cfg.role}>` : ''}`,
+      embeds: [new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle(`🎫 Ticket #${String(number).padStart(4, '0')}`)
+        .setDescription('Thanks for opening a ticket! Describe your issue and support will be with you shortly.\n\n🔒 **Close** — closes this ticket (with transcript)\n🙋 **Claim** — support staff only')
+        .setFooter({ text: `Opened by ${interaction.user.tag}` })
+        .setTimestamp()],
+      components: [row],
+      allowedMentions: { users: [interaction.user.id], roles: cfg.role ? [cfg.role] : [] },
+    });
+    return interaction.editReply(`✅ Your ticket is ready: ${channel}`);
+  }
+
+  // Everything below only makes sense inside an open ticket channel
+  const ticket = await db.get(`tickets.${guild.id}.open.${interaction.channelId}`);
+  if (!ticket) return interaction.reply({ content: '❌ This isn\'t an active ticket channel.', ephemeral: true });
+
+  // ── Claim ────────────────────────────────────────────────────
+  if (customId === 'ticket_claim') {
+    if (!isSupport(member, cfg))
+      return interaction.reply({ content: '❌ Only support staff can claim tickets.', ephemeral: true });
+    if (ticket.claimedBy)
+      return interaction.reply({ content: `❌ Already claimed by <@${ticket.claimedBy}>.`, ephemeral: true });
+    await db.set(`tickets.${guild.id}.open.${interaction.channelId}`, { ...ticket, claimedBy: interaction.user.id });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription(`🙋 ${interaction.user} will be handling this ticket.`)] });
+  }
+
+  // ── Close (with confirmation) ────────────────────────────────
+  if (customId === 'ticket_close') {
+    // Ticket opener OR support can close
+    if (interaction.user.id !== ticket.userId && !isSupport(member, cfg))
+      return interaction.reply({ content: '❌ Only the ticket opener or support staff can close this.', ephemeral: true });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ticket_close_confirm').setLabel('Yes, close it').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('ticket_close_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.reply({ content: '⚠️ Close this ticket? A transcript will be saved, then the channel is deleted.', components: [row] });
+  }
+
+  if (customId === 'ticket_close_cancel') {
+    return interaction.update({ content: '✅ Close cancelled.', components: [] });
+  }
+
+  if (customId === 'ticket_close_confirm') {
+    if (interaction.user.id !== ticket.userId && !isSupport(member, cfg))
+      return interaction.reply({ content: '❌ Only the ticket opener or support staff can close this.', ephemeral: true });
+    await interaction.update({ content: '🔒 Closing ticket & saving transcript…', components: [] }).catch(() => {});
+    return closeTicket(interaction.channel, interaction.user);
+  }
+});
 
 // ─────────────────────────────────────────────
 //  GIVEAWAY END
@@ -392,6 +585,20 @@ async function makeShipCard(a, b, score) {
 //  HELP MENU DATA
 // ─────────────────────────────────────────────
 const HELP = {
+  tickets: {
+    emoji: '🎫', label: 'Tickets', desc: 'Support ticket system with transcripts',
+    commands: [
+      ['ticket setup [#channel] [title]', 'Post the ticket panel with the Open button'],
+      ['ticket role @role', 'Set the support role (sees + gets pinged in tickets)'],
+      ['ticket category <id/name>', 'Category where ticket channels are created'],
+      ['ticket log #channel', 'Where closed-ticket transcripts are posted'],
+      ['ticket limit <1-5>', 'Max open tickets per user (default 1)'],
+      ['ticket status', 'View current ticket configuration'],
+      ['add @user', 'Add someone to the current ticket (staff)'],
+      ['remove @user', 'Remove someone from the current ticket (staff)'],
+      ['close', 'Close the current ticket (opener or staff)'],
+    ],
+  },
   moderation: {
     emoji: '🔨', label: 'Moderation', desc: 'Bans, kicks, mutes, warns, purge, lock',
     commands: [
@@ -700,7 +907,7 @@ async function autoRestore(guild) {
 client.once('ready', async () => {
   console.log(`✅ ${client.user.tag} online`);
   client.user.setPresence({
-    activities: [{ name: 'BREN THE GOAT', type: ActivityType.Watching }],
+    activities: [{ name: '.gg/rasengan', type: ActivityType.Watching }],
     status: 'online',
   });
 
@@ -2090,6 +2297,113 @@ client.on('messageCreate', async message => {
       .then(m => setTimeout(() => m.delete().catch(() => {}), 8000));
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  TICKET COMMANDS
+  // ═══════════════════════════════════════════════════════════════
+
+  // ── -ticket (setup & config) ───────────────────────────────────
+  else if (cmd === 'ticket' || cmd === 'tickets') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    const gid = message.guild.id;
+    const sub = args[0]?.toLowerCase();
+    const cfg = await getTicketConfig(gid);
+
+    if (sub === 'setup' || sub === 'panel') {
+      const ch = message.mentions.channels.first() || message.channel;
+      const title = args.slice(ch === message.channel ? 1 : 2).join(' ');
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('ticket_open').setLabel('Open a Ticket').setEmoji('🎫').setStyle(ButtonStyle.Primary),
+      );
+      await ch.send({
+        embeds: [new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle(title || '🎫 Support Tickets')
+          .setDescription('Need help? Click the button below to open a private ticket with the staff team.')
+          .setFooter({ text: message.guild.name, iconURL: message.guild.iconURL() ?? undefined })],
+        components: [row],
+      });
+      return message.reply(`✅ Ticket panel posted in ${ch}.${cfg.role ? '' : `\n💡 Tip: set a support role with \`${PREFIX}ticket role @role\` so staff get pinged and can see tickets.`}`);
+    }
+
+    if (sub === 'role') {
+      const role = message.mentions.roles.first();
+      if (!role) return message.reply(`❌ Usage: \`${PREFIX}ticket role @role\``);
+      await db.set(`tickets.${gid}.config`, { ...cfg, role: role.id });
+      return message.reply({ content: `✅ Support role set to **${role.name}** — they'll see and get pinged in new tickets.`, allowedMentions: { parse: [] } });
+    }
+
+    if (sub === 'category') {
+      const cat = message.guild.channels.cache.get(args[1]) ??
+                  message.guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === args.slice(1).join(' ').toLowerCase());
+      if (!cat || cat.type !== ChannelType.GuildCategory)
+        return message.reply(`❌ Usage: \`${PREFIX}ticket category <category-ID or exact name>\``);
+      await db.set(`tickets.${gid}.config`, { ...cfg, category: cat.id });
+      return message.reply(`✅ New tickets will be created under **${cat.name}**.`);
+    }
+
+    if (sub === 'log') {
+      if (args[1]?.toLowerCase() === 'disable') {
+        await db.set(`tickets.${gid}.config`, { ...cfg, log: null });
+        return message.reply('✅ Ticket transcript logging disabled.');
+      }
+      const ch = message.mentions.channels.first();
+      if (!ch) return message.reply(`❌ Usage: \`${PREFIX}ticket log #channel\` or \`${PREFIX}ticket log disable\``);
+      await db.set(`tickets.${gid}.config`, { ...cfg, log: ch.id });
+      return message.reply(`✅ Ticket transcripts → ${ch}.`);
+    }
+
+    if (sub === 'limit') {
+      const n = parseInt(args[1]);
+      if (isNaN(n) || n < 1 || n > 5) return message.reply(`❌ Usage: \`${PREFIX}ticket limit <1-5>\` (open tickets per user)`);
+      await db.set(`tickets.${gid}.config`, { ...cfg, limit: n });
+      return message.reply(`✅ Users can now have **${n}** open ticket(s) at a time.`);
+    }
+
+    if (sub === 'status' || !sub) {
+      const open = (await db.get(`tickets.${gid}.open`)) || {};
+      const count = Object.keys(open).length;
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎫 Ticket System').addFields(
+        { name: 'Support Role', value: cfg.role ? `<@&${cfg.role}>` : '❌ Not set', inline: true },
+        { name: 'Category', value: cfg.category ? `<#${cfg.category}>` : 'None (top level)', inline: true },
+        { name: 'Transcript Log', value: cfg.log ? `<#${cfg.log}>` : '❌ Not set', inline: true },
+        { name: 'Limit / user', value: String(cfg.limit || 1), inline: true },
+        { name: 'Open Tickets', value: String(count), inline: true },
+        { name: 'Total Opened', value: String((await db.get(`tickets.${gid}.counter`)) || 0), inline: true },
+      ).setFooter({ text: `Setup: ${PREFIX}ticket setup [#channel] [panel title]` }).setTimestamp()] });
+    }
+
+    return message.reply(`❌ Subcommands: \`setup [#channel] [title]\` \`role @role\` \`category <id/name>\` \`log #channel\` \`limit <1-5>\` \`status\``);
+  }
+
+  // ── -add / -remove / -close (inside a ticket) ──────────────────
+  else if (cmd === 'add' || cmd === 'remove') {
+    const ticket = await db.get(`tickets.${message.guild.id}.open.${message.channel.id}`);
+    if (!ticket) return message.reply('❌ This command only works inside a ticket channel.');
+    const cfg = await getTicketConfig(message.guild.id);
+    if (!isSupport(message.member, cfg))
+      return message.reply('❌ Only support staff can add/remove users from tickets.');
+    const target = await resolveMember(message, args[0]);
+    if (!target) return message.reply(`❌ Usage: \`${PREFIX}${cmd} @user\``);
+    if (cmd === 'add') {
+      await message.channel.permissionOverwrites.edit(target.id, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true, AttachFiles: true });
+      return message.reply(`✅ Added ${target} to the ticket.`);
+    }
+    if (target.id === ticket.userId) return message.reply('❌ You can\'t remove the ticket opener — close the ticket instead.');
+    await message.channel.permissionOverwrites.delete(target.id).catch(() => {});
+    return message.reply({ content: `✅ Removed **${target.user.tag}** from the ticket.`, allowedMentions: { parse: [] } });
+  }
+
+  else if (cmd === 'close') {
+    const ticket = await db.get(`tickets.${message.guild.id}.open.${message.channel.id}`);
+    if (!ticket) return message.reply('❌ This command only works inside a ticket channel.');
+    const cfg = await getTicketConfig(message.guild.id);
+    if (message.author.id !== ticket.userId && !isSupport(message.member, cfg))
+      return message.reply('❌ Only the ticket opener or support staff can close this.');
+    await message.reply('🔒 Closing ticket & saving transcript…');
+    return closeTicket(message.channel, message.author);
+  }
+
   // ── -say ──────────────────────────────────────────────────────
   else if (cmd === 'say') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
@@ -2102,8 +2416,4 @@ client.on('messageCreate', async message => {
   }
 });
 
-if (!process.env.BOT_TOKEN) {
-  console.error('❌ BOT_TOKEN is not set. Add it as an environment variable on your host (e.g. Railway/Render variables tab, or docker run -e BOT_TOKEN=...).');
-  process.exit(1);
-}
 client.login(process.env.BOT_TOKEN);
